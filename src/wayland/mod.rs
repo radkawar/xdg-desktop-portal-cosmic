@@ -417,7 +417,7 @@ impl WaylandHelper {
     }
 
     pub fn capture_source_session(&self, source: CaptureSource, overlay_cursor: bool) -> Session {
-        Session(Arc::new_cyclic(|weak_session| {
+        let session = Session(Arc::new_cyclic(|weak_session| {
             let options = if overlay_cursor {
                 CaptureOptions::PaintCursors
             } else {
@@ -438,15 +438,16 @@ impl WaylandHelper {
                 )
                 .unwrap();
 
-            self.inner.conn.flush().unwrap();
-
             SessionInner {
                 wayland_helper: self.clone(),
                 capture_session,
                 condvar: Condvar::new(),
                 state: Default::default(),
             }
-        }))
+        }));
+        // Dispatch can upgrade the session only after Arc::new_cyclic returns.
+        self.inner.conn.flush().unwrap();
+        session
     }
 
     pub async fn capture_source_shm(

@@ -9,7 +9,9 @@ use remote_desktop_ei::{Command, EiSender};
 use std::collections::HashMap;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use tokio::sync::mpsc::Sender;
+use std::sync::OnceLock;
+use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+use zbus::object_server::{DispatchResult2, Interface, SignalEmitter};
 use zbus::zvariant;
 
 // Device types, as defined by the RemoteDesktop portal spec.
@@ -137,68 +139,245 @@ trait CosmicCompEi {
 }
 
 pub struct RemoteDesktop {
+    api: RemoteDesktopApi,
+    input: OnceLock<UnboundedSender<(zbus::Connection, zbus::Message)>>,
+}
+
+#[derive(Clone)]
+struct RemoteDesktopApi {
     wayland_helper: WaylandHelper,
     tx: Sender<subscription::Event>,
 }
 
 impl RemoteDesktop {
     pub fn new(wayland_helper: WaylandHelper, tx: Sender<subscription::Event>) -> Self {
-        Self { wayland_helper, tx }
+        Self {
+            api: RemoteDesktopApi { wayland_helper, tx },
+            input: OnceLock::new(),
+        }
+    }
+}
+
+// zbus's default per-call tasks can reorder Notify* calls before they reach a
+// session mutex. Queue them in dispatch order, but keep consent and Session.Close
+// independent of input initialization and backpressure.
+#[zbus::export::async_trait::async_trait]
+impl Interface for RemoteDesktop {
+    fn name() -> zbus::names::InterfaceName<'static> {
+        RemoteDesktopApi::name()
     }
 
-    async fn ei_sender(
+    fn spawn_tasks_for_methods(&self) -> bool {
+        false
+    }
+
+    async fn get(
+        &self,
+        name: &str,
+        server: &zbus::ObjectServer,
+        connection: &zbus::Connection,
+        header: Option<&zbus::message::Header<'_>>,
+        emitter: &SignalEmitter<'_>,
+    ) -> Option<zbus::fdo::Result<zvariant::OwnedValue>> {
+        self.api
+            .get(name, server, connection, header, emitter)
+            .await
+    }
+
+    async fn get_all(
+        &self,
+        server: &zbus::ObjectServer,
+        connection: &zbus::Connection,
+        header: Option<&zbus::message::Header<'_>>,
+        emitter: &SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<HashMap<String, zvariant::OwnedValue>> {
+        self.api.get_all(server, connection, header, emitter).await
+    }
+
+    fn set<'call>(
+        &'call self,
+        name: &'call str,
+        value: &'call zvariant::Value<'_>,
+        server: &'call zbus::ObjectServer,
+        connection: &'call zbus::Connection,
+        header: Option<&'call zbus::message::Header<'_>>,
+        emitter: &'call SignalEmitter<'_>,
+    ) -> DispatchResult2<'call> {
+        self.api
+            .set(name, value, server, connection, header, emitter)
+    }
+
+    async fn set_mut(
+        &mut self,
+        name: &str,
+        value: &zvariant::Value<'_>,
+        server: &zbus::ObjectServer,
+        connection: &zbus::Connection,
+        header: Option<&zbus::message::Header<'_>>,
+        emitter: &SignalEmitter<'_>,
+    ) -> Option<zbus::fdo::Result<()>> {
+        self.api
+            .set_mut(name, value, server, connection, header, emitter)
+            .await
+    }
+
+    fn call<'call>(
+        &'call self,
+        _server: &'call zbus::ObjectServer,
+        connection: &'call zbus::Connection,
+        msg: &'call zbus::Message,
+        name: zbus::names::MemberName<'call>,
+    ) -> DispatchResult2<'call> {
+        let connection = connection.clone();
+        let msg = msg.clone();
+        if name.starts_with("Notify") {
+            let input = self.input.get_or_init(|| {
+                let (tx, mut rx) = mpsc::unbounded_channel::<(zbus::Connection, zbus::Message)>();
+                let mut api = self.api.clone();
+                tokio::spawn(async move {
+                    while let Some((connection, msg)) = rx.recv().await {
+                        dispatch_remote_desktop(&mut api, &connection, &msg).await;
+                    }
+                });
+                tx
+            });
+            let result = input.send((connection, msg));
+            DispatchResult2::Async(Box::pin(async move {
+                result.map_err(|_| zbus::fdo::Error::Failed("Input dispatcher stopped".into()))
+            }))
+        } else {
+            let mut api = self.api.clone();
+            tokio::spawn(async move {
+                dispatch_remote_desktop(&mut api, &connection, &msg).await;
+            });
+            DispatchResult2::Async(Box::pin(async { Ok(()) }))
+        }
+    }
+
+    fn call_mut<'call>(
+        &'call mut self,
+        server: &'call zbus::ObjectServer,
+        connection: &'call zbus::Connection,
+        msg: &'call zbus::Message,
+        name: zbus::names::MemberName<'call>,
+    ) -> DispatchResult2<'call> {
+        self.api.call_mut(server, connection, msg, name)
+    }
+
+    fn introspect_to_writer(&self, writer: &mut dyn std::fmt::Write, level: usize) {
+        self.api.introspect_to_writer(writer, level);
+    }
+}
+
+async fn dispatch_remote_desktop(
+    api: &mut RemoteDesktopApi,
+    connection: &zbus::Connection,
+    msg: &zbus::Message,
+) {
+    let header = msg.header();
+    let name = header
+        .member()
+        .expect("ObjectServer checked the method name");
+    let server = connection.object_server();
+    let result = {
+        match api.call(server, connection, msg, name.as_ref()) {
+            DispatchResult2::Async(future) => Some(future.await),
+            DispatchResult2::NotFound => {
+                Some(Err(zbus::fdo::Error::UnknownMethod(name.to_string())))
+            }
+            DispatchResult2::RequiresMut => None,
+        }
+    };
+    let result = match result {
+        Some(result) => result,
+        None => match api.call_mut(server, connection, msg, name.as_ref()) {
+            DispatchResult2::Async(future) => future.await,
+            _ => Err(zbus::fdo::Error::UnknownMethod(name.to_string())),
+        },
+    };
+    if let Err(err) = result
+        && let Err(err) = connection.reply_dbus_error(&header, err).await
+    {
+        tracing::debug!("Failed to reply to RemoteDesktop method: {err}");
+    }
+}
+
+impl RemoteDesktopApi {
+    async fn notify(
         &self,
         connection: &zbus::Connection,
         session_handle: &zvariant::ObjectPath<'_>,
-    ) -> Option<EiSender> {
-        let interface = crate::session_interface::<SessionData>(connection, session_handle).await?;
-
-        let device_types = {
+        command: Command,
+    ) {
+        let Some(interface) =
+            crate::session_interface::<SessionData>(connection, session_handle).await
+        else {
+            return;
+        };
+        let (sender, device_types) = {
             let session_data = interface.get().await;
             if session_data.closed {
-                return None;
+                return;
             }
-            let remote_desktop = session_data.remote_desktop.as_ref()?;
+            let Some(remote_desktop) = session_data.remote_desktop.as_ref() else {
+                return;
+            };
             if !remote_desktop.started {
-                return None;
+                return;
             }
-            if let Some(sender) = remote_desktop.ei_sender.clone() {
-                return Some(sender);
-            }
-            remote_desktop.device_types
+            (
+                remote_desktop.ei_sender.clone(),
+                remote_desktop.device_types,
+            )
         };
 
-        let proxy = CosmicCompEiProxy::new(connection).await.ok()?;
-        let fd = match proxy.get_sender_socket(device_types).await {
-            Ok(fd) => fd,
-            Err(err) => {
-                tracing::error!("Failed to get ei sender socket: {err}");
-                return None;
-            }
-        };
-        let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
-        {
-            let mut session_data = interface.get_mut().await;
-            if session_data.closed {
-                return None;
-            }
-            let remote_desktop = session_data.remote_desktop.as_mut()?;
-            remote_desktop.input_sockets.push(stream.try_clone().ok()?);
-        }
-        match EiSender::connect(stream, device_types).await {
-            Ok(sender) => {
+        let sender = if let Some(sender) = sender {
+            sender
+        } else {
+            let Ok(proxy) = CosmicCompEiProxy::new(connection).await else {
+                return;
+            };
+            let fd = match proxy.get_sender_socket(device_types).await {
+                Ok(fd) => fd,
+                Err(err) => {
+                    tracing::error!("Failed to get ei sender socket: {err}");
+                    return;
+                }
+            };
+            let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
+            let Ok(retained) = stream.try_clone() else {
+                return;
+            };
+            {
                 let mut session_data = interface.get_mut().await;
                 if session_data.closed {
-                    return None;
+                    return;
                 }
-                session_data.remote_desktop.as_mut()?.ei_sender = Some(sender.clone());
-                Some(sender)
+                let Some(remote_desktop) = session_data.remote_desktop.as_mut() else {
+                    return;
+                };
+                remote_desktop.input_sockets.push(retained);
             }
-            Err(err) => {
-                tracing::error!("Failed to create remote desktop ei sender: {err}");
-                None
+            let initialized = match EiSender::connect(stream, device_types).await {
+                Ok(sender) => sender,
+                Err(err) => {
+                    tracing::error!("Failed to create remote desktop ei sender: {err}");
+                    return;
+                }
+            };
+            {
+                let mut session_data = interface.get_mut().await;
+                if session_data.closed {
+                    return;
+                }
+                let Some(remote_desktop) = session_data.remote_desktop.as_mut() else {
+                    return;
+                };
+                remote_desktop.ei_sender = Some(initialized.clone());
             }
-        }
+            initialized
+        };
+        sender.send(command).await;
     }
 
     /// The global logical offset of a stream (the captured output's position).
@@ -226,22 +405,11 @@ impl RemoteDesktop {
             })
             .unwrap_or((0, 0))
     }
-
-    async fn notify(
-        &self,
-        connection: &zbus::Connection,
-        session_handle: &zvariant::ObjectPath<'_>,
-        command: Command,
-    ) {
-        if let Some(sender) = self.ei_sender(connection, session_handle).await {
-            sender.send(command);
-        }
-    }
 }
 
 #[allow(unused_variables)]
 #[zbus::interface(name = "org.freedesktop.impl.portal.RemoteDesktop")]
-impl RemoteDesktop {
+impl RemoteDesktopApi {
     async fn create_session(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,

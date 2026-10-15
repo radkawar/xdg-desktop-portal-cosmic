@@ -9,7 +9,7 @@ use futures::StreamExt;
 use reis::ei;
 use reis::event::{Device, DeviceCapability, EiEvent};
 use rustix::time::{ClockId, clock_gettime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::remote_desktop::{DEVICE_KEYBOARD, DEVICE_POINTER, DEVICE_TOUCHSCREEN};
 
@@ -36,7 +36,7 @@ impl EiSender {
     // reis's event stream is !Send so we run the loop on its own thread
     pub async fn connect(stream: UnixStream, device_types: u32) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(64);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("xdpc-ei-sender".to_owned())
             .spawn(move || {
@@ -65,8 +65,14 @@ impl EiSender {
                     };
                     match connect.await {
                         Ok((connection, events)) => {
-                            let _ = ready_tx.send(Ok(()));
-                            run(connection, events, capabilities_for(device_types), rx).await;
+                            run(
+                                connection,
+                                events,
+                                capabilities_for(device_types),
+                                rx,
+                                ready_tx,
+                            )
+                            .await;
                         }
                         Err(err) => {
                             let _ = ready_tx.send(Err(err));
@@ -80,8 +86,8 @@ impl EiSender {
         Ok(Self { tx })
     }
 
-    pub fn send(&self, command: Command) {
-        if let Err(err) = self.tx.try_send(command) {
+    pub async fn send(&self, command: Command) {
+        if let Err(err) = self.tx.send(command).await {
             tracing::warn!("Failed to queue remote desktop input event: {err}");
         }
     }
@@ -114,6 +120,7 @@ struct DeviceState {
 struct State {
     connection: reis::event::Connection,
     caps: BitFlags<DeviceCapability>,
+    ready: Option<oneshot::Sender<std::io::Result<()>>>,
     devices: HashMap<Device, DeviceState>,
     abs_regions: Vec<(i32, i32, f64)>,
 }
@@ -123,13 +130,16 @@ async fn run(
     mut events: reis::tokio::EiConvertEventStream,
     caps: BitFlags<DeviceCapability>,
     mut rx: mpsc::Receiver<Command>,
+    ready: oneshot::Sender<std::io::Result<()>>,
 ) {
     let mut state = State {
         connection,
         caps,
+        ready: Some(ready),
         devices: HashMap::new(),
         abs_regions: Vec::new(),
     };
+    state.ready_if_devices_resumed();
     loop {
         tokio::select! {
             event = events.next() => match event {
@@ -150,6 +160,19 @@ async fn run(
 }
 
 impl State {
+    fn ready_if_devices_resumed(&mut self) {
+        if self.ready.is_some()
+            && self.caps.iter().all(|capability| {
+                self.devices
+                    .iter()
+                    .any(|(device, state)| state.emulating && device.has_capability(capability))
+            })
+            && let Some(ready) = self.ready.take()
+        {
+            let _ = ready.send(Ok(()));
+        }
+    }
+
     fn handle_event(&mut self, event: EiEvent) {
         match event {
             EiEvent::SeatAdded(evt) => {
@@ -183,6 +206,7 @@ impl State {
                     state.emulating = true;
                     let _ = self.connection.flush();
                 }
+                self.ready_if_devices_resumed();
             }
             EiEvent::DevicePaused(evt) => {
                 if let Some(state) = self.devices.get_mut(&evt.device) {

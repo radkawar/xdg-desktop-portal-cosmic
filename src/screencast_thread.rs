@@ -158,6 +158,14 @@ impl ScreencastThread {
         cursor_mode: CursorMode,
         stream_props: StreamProps,
     ) -> anyhow::Result<Self> {
+        let session = wayland_helper
+            .capture_source_session(capture_source.clone(), cursor_mode == CursorMode::Embedded);
+        // Keep startup cancellable before the worker's loop can handle Stop.
+        let Some(formats) = session.wait_for_formats(|formats| formats.clone()).await else {
+            return Err(anyhow::anyhow!(
+                "failed to get formats for image copy; session stopped"
+            ));
+        };
         let (tx, rx) = oneshot::channel();
         let (thread_stop_tx, thread_stop_rx) = pipewire::channel::channel::<()>();
         let thread_stop_tx_clone = thread_stop_tx.clone();
@@ -167,6 +175,8 @@ impl ScreencastThread {
                 wayland_helper,
                 capture_source,
                 cursor_mode,
+                session,
+                formats,
                 thread_stop_tx_clone,
             ) {
                 Ok((loop_, _stream, _listener, _context, node_id_rx)) => {
@@ -327,14 +337,12 @@ impl StreamData {
         match new {
             StreamState::Paused => {
                 if let Some(node_id_tx) = self.node_id_tx.take() {
-                    node_id_tx.send(Ok(stream.node_id())).unwrap();
+                    let _ = node_id_tx.send(Ok(stream.node_id()));
                 }
             }
             StreamState::Error(msg) => {
                 if let Some(node_id_tx) = self.node_id_tx.take() {
-                    node_id_tx
-                        .send(Err(anyhow::anyhow!("stream error: {}", msg)))
-                        .unwrap();
+                    let _ = node_id_tx.send(Err(anyhow::anyhow!("stream error: {}", msg)));
                 }
             }
             _ => {}
@@ -623,6 +631,8 @@ fn start_stream(
     wayland_helper: WaylandHelper,
     capture_source: CaptureSource,
     cursor_mode: CursorMode,
+    session: Session,
+    formats: Formats,
     thread_stop_tx: pipewire::channel::Sender<()>,
 ) -> anyhow::Result<(
     pipewire::main_loop::MainLoopRc,
@@ -639,8 +649,6 @@ fn start_stream(
 
     let (node_id_tx, node_id_rx) = oneshot::channel();
 
-    let session = wayland_helper
-        .capture_source_session(capture_source.clone(), cursor_mode == CursorMode::Embedded);
     let mut cursor_session = None;
     let mut cursor_frame = None;
     if cursor_mode == CursorMode::Metadata {
@@ -653,12 +661,6 @@ fn start_stream(
             }
         }
     }
-
-    let Some(formats) = block_on(session.wait_for_formats(|formats| formats.clone())) else {
-        return Err(anyhow::anyhow!(
-            "failed to get formats for image copy; session stopped"
-        ));
-    };
 
     let dmabuf_helper = wayland_helper.dmabuf();
 
