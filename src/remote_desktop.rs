@@ -7,6 +7,7 @@ use crate::{
 };
 use remote_desktop_ei::{Command, EiSender};
 use std::collections::HashMap;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use tokio::sync::mpsc::Sender;
 use zbus::zvariant;
@@ -30,6 +31,8 @@ pub(crate) struct RemoteDesktopData {
     pub(crate) screen_cast_enabled: bool,
     restore: Option<PersistedRemoteDesktop>,
     pub(crate) ei_sender: Option<EiSender>,
+    started: bool,
+    input_sockets: Vec<UnixStream>,
     pub(crate) stream_offsets: Vec<(u32, (i32, i32))>,
 }
 
@@ -43,8 +46,28 @@ impl Default for RemoteDesktopData {
             screen_cast_enabled: false,
             restore: None,
             ei_sender: None,
+            started: false,
+            input_sockets: Vec::new(),
             stream_offsets: Vec::new(),
         }
+    }
+}
+
+impl RemoteDesktopData {
+    pub(crate) fn close(&mut self) {
+        self.started = false;
+        for socket in self.input_sockets.drain(..) {
+            if let Err(err) = socket.shutdown(Shutdown::Both) {
+                tracing::debug!("Failed to shut down remote desktop input socket: {err}");
+            }
+        }
+        self.ei_sender = None;
+    }
+}
+
+impl Drop for RemoteDesktopData {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -132,7 +155,13 @@ impl RemoteDesktop {
 
         let device_types = {
             let session_data = interface.get().await;
+            if session_data.closed {
+                return None;
+            }
             let remote_desktop = session_data.remote_desktop.as_ref()?;
+            if !remote_desktop.started {
+                return None;
+            }
             if let Some(sender) = remote_desktop.ei_sender.clone() {
                 return Some(sender);
             }
@@ -148,11 +177,21 @@ impl RemoteDesktop {
             }
         };
         let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
+        {
+            let mut session_data = interface.get_mut().await;
+            if session_data.closed {
+                return None;
+            }
+            let remote_desktop = session_data.remote_desktop.as_mut()?;
+            remote_desktop.input_sockets.push(stream.try_clone().ok()?);
+        }
         match EiSender::connect(stream, device_types).await {
             Ok(sender) => {
-                if let Some(remote_desktop) = interface.get_mut().await.remote_desktop.as_mut() {
-                    remote_desktop.ei_sender = Some(sender.clone());
+                let mut session_data = interface.get_mut().await;
+                if session_data.closed {
+                    return None;
                 }
+                session_data.remote_desktop.as_mut()?.ei_sender = Some(sender.clone());
                 Some(sender)
             }
             Err(err) => {
@@ -238,9 +277,15 @@ impl RemoteDesktop {
             return PortalResponse::Other;
         };
         let mut session_data = interface.get_mut().await;
+        if session_data.closed {
+            return PortalResponse::Other;
+        }
         let Some(remote_desktop) = session_data.remote_desktop.as_mut() else {
             return PortalResponse::Other;
         };
+        if remote_desktop.started {
+            return PortalResponse::Other;
+        }
         remote_desktop.device_types = options.types.unwrap_or(ALL_DEVICE_TYPES) & ALL_DEVICE_TYPES;
         remote_desktop.persist_mode = options.persist_mode.unwrap_or(PERSIST_NONE);
         remote_desktop.restore = options
@@ -259,8 +304,14 @@ impl RemoteDesktop {
         parent_window: String,
         options: HashMap<String, zvariant::OwnedValue>,
     ) -> PortalResponse<StartResult> {
-        let on_cancel =
-            || remote_desktop_dialog::hide_remote_desktop_prompt(&self.tx, &session_handle);
+        let on_cancel = || async {
+            if let Some(interface) =
+                crate::session_interface::<SessionData>(connection, &session_handle).await
+            {
+                interface.get_mut().await.data.close();
+            }
+            remote_desktop_dialog::hide_remote_desktop_prompt(&self.tx, &session_handle).await;
+        };
         Request::run(connection, &handle, on_cancel, async {
             let Some(interface) =
                 crate::session_interface::<SessionData>(connection, &session_handle).await
@@ -273,6 +324,9 @@ impl RemoteDesktop {
                 let Some(remote_desktop) = session_data.remote_desktop.as_mut() else {
                     return PortalResponse::Other;
                 };
+                if remote_desktop.started {
+                    return PortalResponse::Other;
+                }
                 remote_desktop.restore.take()
             };
 
@@ -403,8 +457,15 @@ impl RemoteDesktop {
                 .iter()
                 .map(|(node, props)| (*node, props.position().unwrap_or((0, 0))))
                 .collect();
-            if let Some(remote_desktop) = interface.get_mut().await.remote_desktop.as_mut() {
-                remote_desktop.stream_offsets = stream_offsets;
+            {
+                let mut session_data = interface.get_mut().await;
+                if session_data.closed {
+                    return PortalResponse::Cancelled;
+                }
+                if let Some(remote_desktop) = session_data.remote_desktop.as_mut() {
+                    remote_desktop.stream_offsets = stream_offsets;
+                    remote_desktop.started = true;
+                }
             }
 
             PortalResponse::Success(StartResult {
@@ -431,22 +492,32 @@ impl RemoteDesktop {
         else {
             return Err(zbus::fdo::Error::Failed("No such session".to_string()));
         };
-        let Some(device_types) = interface
-            .get()
-            .await
-            .remote_desktop
-            .as_ref()
-            .map(|remote_desktop| remote_desktop.device_types)
-        else {
+        let mut session_data = interface.get_mut().await;
+        if session_data.closed {
+            return Err(zbus::fdo::Error::Failed("Session is closed".to_string()));
+        }
+        let Some(remote_desktop) = session_data.remote_desktop.as_mut() else {
             return Err(zbus::fdo::Error::Failed(
                 "Not a remote desktop session".to_string(),
             ));
         };
+        if !remote_desktop.started {
+            return Err(zbus::fdo::Error::Failed(
+                "Remote desktop session has not started".to_string(),
+            ));
+        }
         let proxy = CosmicCompEiProxy::new(connection).await?;
-        proxy
-            .get_sender_socket(device_types)
+        let fd = proxy
+            .get_sender_socket(remote_desktop.device_types)
             .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to connect to EIS: {e}")))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to connect to EIS: {e}")))?;
+        let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
+        remote_desktop.input_sockets.push(
+            stream
+                .try_clone()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?,
+        );
+        Ok(std::os::fd::OwnedFd::from(stream).into())
     }
 
     // Notify* for legacy clients that don't use ConnectToEIS.
@@ -622,5 +693,27 @@ impl RemoteDesktop {
     #[zbus(property, name = "version")]
     async fn version(&self) -> u32 {
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn closing_revokes_input_even_when_client_keeps_its_fd() {
+        let (mut client, mut compositor) = UnixStream::pair().unwrap();
+        let mut session = RemoteDesktopData::default();
+        session.started = true;
+        session.input_sockets.push(client.try_clone().unwrap());
+        client.write_all(b"input").unwrap();
+        let mut input = [0; 5];
+        compositor.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"input");
+        session.close();
+        assert!(!session.started);
+        assert!(client.write_all(b"late input").is_err());
+        assert_eq!(compositor.read(&mut input).unwrap(), 0);
     }
 }

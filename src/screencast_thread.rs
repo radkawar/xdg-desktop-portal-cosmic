@@ -140,7 +140,15 @@ impl MetadataCursor {
 pub struct ScreencastThread {
     stream_props: StreamProps,
     node_id: u32,
-    thread_stop_tx: pipewire::channel::Sender<()>,
+    _stop: StopOnDrop,
+}
+
+struct StopOnDrop(pipewire::channel::Sender<()>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl ScreencastThread {
@@ -153,6 +161,7 @@ impl ScreencastThread {
         let (tx, rx) = oneshot::channel();
         let (thread_stop_tx, thread_stop_rx) = pipewire::channel::channel::<()>();
         let thread_stop_tx_clone = thread_stop_tx.clone();
+        let stop = StopOnDrop(thread_stop_tx);
         std::thread::spawn(move || {
             match start_stream(
                 wayland_helper,
@@ -161,21 +170,30 @@ impl ScreencastThread {
                 thread_stop_tx_clone,
             ) {
                 Ok((loop_, _stream, _listener, _context, node_id_rx)) => {
-                    tx.send(Ok(node_id_rx)).unwrap();
+                    if tx.send(Ok(node_id_rx)).is_err() {
+                        return;
+                    }
                     let weak_loop = loop_.downgrade();
                     let _receiver = thread_stop_rx.attach(loop_.loop_(), move |()| {
                         weak_loop.upgrade().unwrap().quit();
                     });
                     loop_.run();
                 }
-                Err(err) => tx.send(Err(err)).unwrap(),
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                }
             }
         });
+        let node_id_rx = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Screencast thread exited before startup"))??;
+        let node_id = node_id_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Screencast thread exited before publishing a node"))??;
         Ok(Self {
             stream_props,
-            // XXX can second unwrap fail?
-            node_id: rx.await.unwrap()?.await.unwrap()?,
-            thread_stop_tx,
+            node_id,
+            _stop: stop,
         })
     }
 
@@ -185,10 +203,6 @@ impl ScreencastThread {
 
     pub fn node_id(&self) -> u32 {
         self.node_id
-    }
-
-    pub fn stop(self) {
-        let _ = self.thread_stop_tx.send(());
     }
 }
 

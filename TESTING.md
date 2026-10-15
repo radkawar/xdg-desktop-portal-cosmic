@@ -13,3 +13,8 @@ This document provides a regression testing checklist for the COSMIC XDG desktop
 - [ ] Webcam and screen sharing prompted through Firefox works
 - [ ] The file chooser works from Firefox
 - [ ] The file chooser, webcam, and screen share work from the Slack flatpak
+- [ ] RemoteDesktop asks for consent before enabling input
+    - [ ] `ConnectToEIS` and legacy `Notify*` cannot inject before successful `Start`
+    - [ ] Cancelling consent grants neither capture nor input
+    - [ ] A started session captures the selected output and injects only selected devices
+    - [ ] Closing the session stops capture and disconnects input, including a client-held EIS fd

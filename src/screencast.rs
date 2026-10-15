@@ -4,7 +4,6 @@ use ashpd::desktop::screencast::SourceType;
 use ashpd::enumflags2::BitFlags;
 use futures::stream::{FuturesOrdered, StreamExt};
 use std::collections::HashMap;
-use std::mem;
 use tokio::sync::mpsc::Sender;
 use zbus::zvariant;
 
@@ -179,9 +178,10 @@ impl SessionData {
     }
 
     pub(crate) fn close(&mut self) {
-        for thread in mem::take(&mut self.screencast_threads) {
-            thread.stop();
+        if let Some(remote_desktop) = self.remote_desktop.as_mut() {
+            remote_desktop.close();
         }
+        self.screencast_threads.clear();
         self.closed = true
     }
 }
@@ -341,17 +341,13 @@ pub(crate) async fn capture_from_sources(
 
     // Stop any thread that didn't fail
     if failed {
-        for thread in screencast_threads {
-            thread.stop();
-        }
+        drop(screencast_threads);
         return CaptureOutcome::Other;
     }
 
-    // Session may have already been cancelled
-    if interface.get().await.closed {
-        for thread in screencast_threads {
-            thread.stop();
-        }
+    // Closing and publishing capture must be atomic with respect to each other.
+    let mut session_data = interface.get_mut().await;
+    if session_data.closed {
         return CaptureOutcome::Cancelled;
     }
 
@@ -359,7 +355,7 @@ pub(crate) async fn capture_from_sources(
         .iter()
         .map(|thread| (thread.node_id(), thread.stream_props()))
         .collect();
-    interface.get_mut().await.screencast_threads = screencast_threads;
+    session_data.screencast_threads = screencast_threads;
 
     let persisted_capture_sources =
         PersistedCaptureSources::from_capture_sources(wayland_helper, &capture_sources);
